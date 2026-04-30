@@ -520,6 +520,20 @@ def main():
             model, device_ids=[args.local_rank],
             output_device=args.local_rank, find_unused_parameters=True)
 
+    # --- 初始化实验记录器（只在主进程启用，避免多卡并发写文件）---
+    if args.local_rank in [-1, 0]:
+        args.recorder = RunRecorder(out_dir=args.out,
+                                    num_classes=args.num_classes,
+                                    enable=bool(args.log_detail))
+    else:
+        # 给非主进程也挂一个“空记录器”，避免属性缺失
+        class _Noop:
+            def __getattr__(self, name):
+                return lambda *a, **k: None
+        args.recorder = _Noop()
+    # --- /初始化记录器 ---
+
+
     logger.info("***** Running training *****")
     logger.info(f"  Task = {args.dataset}@{args.num_labeled}")
     logger.info(f"  Num Epochs = {args.epochs}")
@@ -628,12 +642,12 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
             targets_x = targets_x.to(args.device)
             feat, feat_mlp, center_feat = model(inputs)
             # -----------------------------------------------------------------------------------------------------------
-            logits = model.classify(feat[:cut1])
-            logits_b = model.classify1(feat[:cut1])
-
             # ------ debias all logits: E = z - beta_eff * b_theta ------
-            logits = apply_bias(logits, args)
-            logits_b = apply_bias(logits_b, args)
+            # 取原始 + 去偏两份
+            logits_raw = model.classify(feat[:cut1])
+            logits_b_raw = model.classify1(feat[:cut1])
+            logits = apply_bias(logits_raw, args)
+            logits_b = apply_bias(logits_b_raw, args)
 
             logits_x = logits[:lbs]
             logits_x_w, logits_x_s, logits_x_s1 = logits[lbs:].chunk(3)
@@ -641,8 +655,9 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
             # logits LA
             logits_x_b_w, logits_x_b_s, logits_x_b_s1 = logits_b[lbs:].chunk(3)
             del logits, logits_b
-            l_u_s = F.cross_entropy(logits_x, targets_x, reduction='mean')
-            l_b_s = F.cross_entropy(logits_x_b + logits_la_s, targets_x, reduction='mean')
+            # 监督 CE 用 raw
+            l_u_s = F.cross_entropy(logits_raw[:lbs], targets_x)
+            l_b_s = F.cross_entropy(logits_b_raw[:lbs] + logits_la_s, targets_x)
             logits_la_u = (- compute_adjustment_by_py((1 - pro) * py_labeled + pro * py_all, 1.0, args) +
                            compute_adjustment_by_py(py_unlabeled, 1 + args.tau / 2, args))
             logits_co = 1 / 2 * (logits_x_w + logits_la_u) + 1 / 2 * logits_x_b_w

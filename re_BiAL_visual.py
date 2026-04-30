@@ -25,8 +25,6 @@ import csv, json
 from pathlib import Path
 import pandas as pd  # NEW: for CSV/Excel saving
 
-
-
 def infer_scenario(args):
     # heuristic naming for plots
     if args.imb_ratio_unlabel == args.imb_ratio_label and args.flag_reverse_LT == 0:
@@ -135,12 +133,15 @@ def _logmeanexp(x, dim=0):
 
 
 @torch.no_grad()
+@torch.no_grad()
 def compute_bias_theta(model, args):
     was_training = model.training
     model.eval()
+
     B = args.bias_probe_batch
-    C, H, W = 3, args.img_size, args.img_size
-    noinfo = torch.zeros(B, C, H, W, device=args.device)
+    # baseline_image: [1, 3, H, W]，在 main 里已经算好并放到 args 里
+    base = args.baseline_image.to(args.device)        # [1, C, H, W]
+    noinfo = base.expand(B, -1, -1, -1).contiguous()  # [B, C, H, W]
 
     out = model(noinfo)  # ← 只前向一次
     feat = out[0] if isinstance(out, tuple) else out  # ← 取特征
@@ -153,6 +154,7 @@ def compute_bias_theta(model, args):
     if was_training:
         model.train()  # ← 恢复训练状态
     return b.detach()
+
 
 
 def update_bias_theta(model, args, epoch):
@@ -479,6 +481,46 @@ def main():
         num_workers=args.num_workers)
 
     args.est_step = 0
+
+    # --- 用所有有标签样本的均值图像作为 bias baseline ---
+    logger.info("Computing mean labeled image as baseline for bias probing ...")
+    mean_image = None
+    total_count = 0
+
+    mean_loader = DataLoader(
+        labeled_dataset,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        shuffle=False,
+        drop_last=False
+    )
+
+    for batch in mean_loader:
+        # batch 可能是 ((inputs_x, inputs_x_s, inputs_x_s1), targets_x) 或类似结构
+        first = batch[0]
+        if isinstance(first, (list, tuple)):
+            # 取第一个视图 inputs_x 作为代表
+            inputs = first[0]
+        else:
+            # 如果数据集本身就是 (inputs, labels) 这种形式
+            inputs = first
+
+        inputs = inputs.to(args.device)
+        bs = inputs.size(0)
+
+        # 累积所有样本的像素和
+        batch_sum = inputs.sum(dim=0, keepdim=True)  # [1, 3, H, W]
+
+        if mean_image is None:
+            mean_image = batch_sum
+        else:
+            mean_image += batch_sum
+
+        total_count += bs
+
+    mean_image = mean_image / float(total_count)  # [1, 3, H, W]
+    args.baseline_image = mean_image.to(args.device)
+    logger.info("Mean labeled image computed and stored in args.baseline_image.")
 
     args.py_con = compute_py(labeled_trainloader, args)
     args.py_uni = torch.ones(args.num_classes) / args.num_classes

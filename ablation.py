@@ -57,6 +57,7 @@ class RunRecorder:
                 w = csv.writer(f)
                 w.writerow([
                     "epoch","seed","scenario",
+                    "debias_sup", "debias_unsup", "debias_test",  # NEW
                     "bias_beta_eff","b_theta_entropy","b_theta_l2",
                     "pl_accept_rate","pl_precision_known",
                     "tail_accept_rate_known","tail_precision_known",
@@ -73,6 +74,7 @@ class RunRecorder:
             w = csv.writer(f)
             w.writerow([
                 kw.get("epoch"), kw.get("seed"), kw.get("scenario"),
+                int(kw.get("debias_sup", 0)), int(kw.get("debias_unsup", 0)), int(kw.get("debias_test", 0)),  # NEW
                 kw.get("bias_beta_eff"), kw.get("b_theta_entropy"), kw.get("b_theta_l2"),
                 kw.get("pl_accept_rate"), kw.get("pl_precision_known"),
                 kw.get("tail_accept_rate_known"), kw.get("tail_precision_known"),
@@ -367,7 +369,20 @@ def main():
     parser.add_argument('--log-detail', type=int, default=1,
                         help='enable extra experiment logging (1=on, 0=off)')
 
+    # —— Ablation toggles ——
+    parser.add_argument('--debias-sup', type=int, default=0, choices=[0, 1],
+                        help='Debias supervised branch in training (0/1)')
+    parser.add_argument('--debias-unsup', type=int, default=1, choices=[0, 1],
+                        help='Debias unlabeled branches (weak/strong) in training (0/1)')
+    parser.add_argument('--debias-test', type=int, default=1, choices=[0, 1],
+                        help='Debias at test-time (0/1)')
+    parser.add_argument('--debiasstart', type=int, default=None,
+                        help='Epoch to start training-time debias; default=bias_start_epoch')
+
     args = parser.parse_args()
+    if args.debiasstart is None:
+        args.debiasstart = args.bias_start_epoch
+
     global best_acc
     global best_acc_b
 
@@ -676,25 +691,39 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
             targets_x = targets_x.to(args.device)
             feat, feat_mlp, center_feat = model(inputs)
             # -----------------------------------------------------------------------------------------------------------
-            logits = model.classify(feat[:cut1])
-            logits_b = model.classify1(feat[:cut1])
+            logits = model.classify(feat[:cut1])  # [lbs + 3*ubs, C]
+            logits_b = model.classify1(feat[:cut1])  # [lbs + 3*ubs, C]
 
-            # ------ debias all logits: E = z - beta_eff * b_theta ------
-            logits = apply_bias(logits, args)
-            logits_b = apply_bias(logits_b, args)
-
+            # 切成：监督 / 无标签(弱/强/强)
             logits_x = logits[:lbs]
             logits_x_w, logits_x_s, logits_x_s1 = logits[lbs:].chunk(3)
+
             logits_x_b = logits_b[:lbs]
-            # logits LA
             logits_x_b_w, logits_x_b_s, logits_x_b_s1 = logits_b[lbs:].chunk(3)
+
+            # 是否启用去偏（训练期）
+            enable_sup = (epoch >= args.debiasstart) and (args.debias_sup == 1)
+            enable_unsup = (epoch >= args.debiasstart) and (args.debias_unsup == 1)
+
+            # 监督分支：按开关减偏
+            if enable_sup:
+                logits_x = apply_bias(logits_x, args)
+                logits_x_b = apply_bias(logits_x_b, args)
+
+            # 无标签分支：按开关减偏（弱/强/强；两路头都处理）
+            if enable_unsup:
+                logits_x_w = apply_bias(logits_x_w, args)
+                logits_x_s = apply_bias(logits_x_s, args)
+                logits_x_s1 = apply_bias(logits_x_s1, args)
+                logits_x_b_w = apply_bias(logits_x_b_w, args)
+                logits_x_b_s = apply_bias(logits_x_b_s, args)
+                logits_x_b_s1 = apply_bias(logits_x_b_s1, args)
+
+
             del logits, logits_b
             l_u_s = F.cross_entropy(logits_x, targets_x, reduction='mean')
             l_b_s = F.cross_entropy(logits_x_b + logits_la_s, targets_x, reduction='mean')
-            # logits_la_u = (- compute_adjustment_by_py((1 - pro) * py_labeled + pro * py_all, 1.0, args) +
-            #                compute_adjustment_by_py(py_unlabeled, 1 + args.tau / 2, args))
-            # 9.4 针对reverse修改1
-            logits_la_u = (- compute_adjustment_by_py((1 - pro) * py_labeled + pro * py_all, args.tau, args) +
+            logits_la_u = (- compute_adjustment_by_py((1 - pro) * py_labeled + pro * py_all, 1.0, args) +
                            compute_adjustment_by_py(py_unlabeled, 1 + args.tau / 2, args))
 
             logits_co = 1 / 2 * (logits_x_w + logits_la_u) + 1 / 2 * logits_x_b_w
@@ -926,6 +955,7 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
                 scenario = infer_scenario(args)
                 args.recorder.log_epoch_row(
                     epoch=epoch, seed=args.seed, scenario=scenario,
+                    debias_sup=args.debias_sup, debias_unsup=args.debias_unsup, debias_test=args.debias_test,  # NEW
                     bias_beta_eff=float(args.bias_beta_eff),
                     b_theta_entropy=b_entropy, b_theta_l2=b_l2,
                     pl_accept_rate=pl_accept_rate, pl_precision_known=pl_prec_known,
@@ -972,8 +1002,9 @@ def test(args, test_loader, model, epoch, la):
             outputs_b = model.classify1(outputs_feat)
 
             # debias at inference for train-test consistency
-            outputs = apply_bias(outputs, args)
-            outputs_b = apply_bias(outputs_b, args)
+            if args.debias_test == 1:
+                outputs = apply_bias(outputs, args)
+                outputs_b = apply_bias(outputs_b, args)
 
             outputs_co = 0.5 * (outputs + la) + 0.5 * outputs_b
             loss = F.cross_entropy(outputs_b, targets)

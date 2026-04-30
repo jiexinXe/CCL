@@ -25,43 +25,6 @@ best_acc = 0
 best_acc_b = 0
 
 
-# ====== 仅测试用：构造基线 & 估计两个头的偏置 ======
-_CIFAR_MEAN = torch.tensor([0.4914, 0.4822, 0.4465]).view(1,3,1,1)
-_CIFAR_STD  = torch.tensor([0.2023, 0.1994, 0.2010]).view(1,3,1,1)
-
-def _const_img(val, device, H, W):
-    x = torch.full((1,3,H,W), float(val), device=device)
-    return (x - _CIFAR_MEAN.to(device)) / _CIFAR_STD.to(device)  # 与数据同归一化
-
-def _make_test_baselines(names, device, H, W):
-    xs = []
-    for n in [s.strip() for s in names.split(',') if s.strip()]:
-        if n == 'black': xs.append(_const_img(0.0, device, H, W))
-        elif n == 'white': xs.append(_const_img(1.0, device, H, W))
-        elif n == 'noise': xs.append(torch.randn(1,3,H,W, device=device))  # 已在标准化空间
-    return torch.cat(xs, dim=0) if len(xs) else _const_img(0.0, device, H, W)
-
-@torch.no_grad()
-def compute_bias_pair_test(model_like, baselines):
-    """
-    用当前(或 EMA)模型在多基线上取 logits，做 log-mean-exp 聚合：
-    返回两个头各自的偏置 b0,b1（均为 [K] 且做均值中心化）。
-    """
-    m = model_like
-    was = m.training
-    m.eval()
-    outs = m(baselines)
-    feat = outs[0] if isinstance(outs, tuple) else outs
-    l0 = m.classify(feat)     # 头A
-    l1 = m.classify1(feat)    # 头B
-    b0 = torch.logsumexp(l0, dim=0) - math.log(l0.size(0))
-    b1 = torch.logsumexp(l1, dim=0) - math.log(l1.size(0))
-    b0 = b0 - b0.mean()
-    b1 = b1 - b1.mean()
-    if was: m.train()
-    return b0, b1
-
-
 def make_imb_data(max_num, class_num, gamma, flag=1, flag_LT=0):
     mu = np.power(1 / gamma, 1 / (class_num - 1))
     class_num_list = []
@@ -225,14 +188,6 @@ def main():
                         help='coefficient of final loss')
     parser.add_argument('--lambda2', default=1.0, type=float,
                         help='coefficient of final loss')
-
-    # —— 仅测试期的去偏开关与强度 ——
-    parser.add_argument('--test-bias', action='store_true', default=False,
-                        help='仅在测试时减去纯色偏置')
-    parser.add_argument('--test-bias-alpha', type=float, default=1.0,
-                        help='测试时去偏强度 α（logits 减 α·b）')
-    parser.add_argument('--test-bias-baselines', type=str, default='black,white',
-                        help='估计偏置用的基线：black,white[,noise]')
 
     args = parser.parse_args()
     global best_acc
@@ -657,18 +612,6 @@ def test(args, test_loader, model, epoch, la):
     end = time.time()
 
     with torch.no_grad():
-
-        # —— 若启用“仅测试去偏”，先一次性估计 b0,b1 并构造 la0,la1
-        use_bias = bool(getattr(args, 'test_bias', False))
-        if use_bias:
-            # 用传进来的 test 模型（你外部已传 EMA 模型）估偏置
-            H = W = getattr(args, 'img_size', 32)
-            bases = _make_test_baselines(args.test_bias_baselines, args.device, H, W)
-            b0, b1 = compute_bias_pair_test(model, bases)
-            alpha = float(getattr(args, 'test_bias_alpha', 0.5))
-            la0 = (-alpha * b0).to(args.device)
-            la1 = (-alpha * b1).to(args.device)
-
         for batch_idx, (inputs, targets) in enumerate(test_loader):
             data_time.update(time.time() - end)
             model.eval()
@@ -679,12 +622,6 @@ def test(args, test_loader, model, epoch, la):
             outputs = model.classify(outputs_feat)
             outputs_b = model.classify1(outputs_feat)
             outputs_co = 1 / 2 * (outputs + la) + 1 / 2 * outputs_b
-
-            if use_bias:
-                outputs_co = 0.5 * (outputs + la0) + 0.5 * (outputs_b + la1)
-            else:
-                outputs_co = 0.5 * (outputs + la) + 0.5 * outputs_b
-
             loss = F.cross_entropy(outputs_b, targets)
 
             prec1_b, prec5_b = accuracy(outputs_b, targets, topk=(1, 5))
